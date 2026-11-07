@@ -117,7 +117,7 @@ const DETAIL = {
   density: 0.52,
   glow: 0.15,
   straightTraces: 44,  // trilhas lineares curtas; 0 desativa
-  orbitSpeed: .90,     // velocidade das órbitas independentes     // inclinação das órbitas independentes no eixo Y
+  orbitSpeed: .80,     // velocidade das órbitas independentes     // inclinação das órbitas independentes no eixo Y
 };
 
 // Ruído suave determinístico: curvas sinuosas, nunca zigue-zagues aleatórios.
@@ -497,9 +497,9 @@ function CoreScene({ status }) {
         Math.sin(clock.elapsedTime * pulseSpeed) * pulseAmplitude;
       shell.current.scale.setScalar(THREE.MathUtils.damp(shell.current.scale.x, target, 2.5, delta));
     }
-    if (circuits.current) circuits.current.rotation.y -= delta * speed * 1.47;
-    if (inner.current) inner.current.rotation.x -= delta * speed * 2.4;
-    if (orbits.current) orbits.current.rotation.z += delta * speed * 8.5;
+    if (circuits.current) circuits.current.rotation.y -= delta * speed * .27;
+    if (inner.current) inner.current.rotation.x -= delta * speed * .02;
+    if (orbits.current) orbits.current.rotation.z += delta * speed * .5;
     // Não estão dentro de shell: as órbitas têm rotação própria, com eixos
     // e sentidos diferentes, mesmo no estado de repouso.
     const orbitalFactor = (status === 'thinking' ? 1.7 : status === 'speaking' ? 1.35 : 1) * DETAIL.orbitSpeed;
