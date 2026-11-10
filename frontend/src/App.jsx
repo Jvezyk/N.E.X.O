@@ -264,11 +264,17 @@ export default function App() {
   const audioControllerRef = useRef(null);
   const playbackIdRef = useRef(0);
   const audioFinishRef = useRef(null);
+  const speechControllersRef = useRef(new Set());
   const recognitionAvailable = typeof window !== 'undefined' &&
     !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 
 
   // Tenta ativar o modo de voz ao entrar; se o navegador exigir interação, o botão continua disponível.
+  // Carrega o Piper em segundo plano enquanto a interface aparece.
+  useEffect(() => {
+    fetch(`${NEXO_API_BASE}/api/piper/warmup`, { method: 'POST' }).catch(() => {});
+  }, []);
+
   useEffect(() => {
     if (recognitionAvailable) {
       wakeEnabledRef.current = true;
@@ -291,6 +297,8 @@ export default function App() {
     wakeRef.current?.abort();
     playbackIdRef.current += 1;
     audioControllerRef.current?.abort();
+    for (const controller of speechControllersRef.current) controller.abort();
+    speechControllersRef.current.clear();
     audioRef.current?.pause();
     if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
   }, []);
@@ -300,6 +308,8 @@ export default function App() {
     audioFinishRef.current?.();
     audioFinishRef.current = null;
     audioControllerRef.current?.abort();
+    for (const controller of speechControllersRef.current) controller.abort();
+    speechControllersRef.current.clear();
     audioControllerRef.current = null;
     if (audioRef.current) {
       audioRef.current.pause();
@@ -428,197 +438,230 @@ export default function App() {
     }
   }
 
-  // Streaming de texto com áudio por frases.
-  // Usa a rota /api/chat/stream e mantém os comandos locais existentes.
-  async function respondWithStreaming(updated, signal) {
-    stopSpeaking();
-    const playbackId = playbackIdRef.current;
-    const id = crypto.randomUUID();
-    const assistantMessage = { id, role: 'assistant', content: '' };
-    messagesRef.current = [...messagesRef.current, assistantMessage];
-    setMessages([...messagesRef.current]);
+// Texto em streaming + voz Piper: próxima frase é sintetizada DURANTE a reprodução.
+// Mantém no máximo UM áudio preparado à frente (economiza RAM no notebook).
+async function respondWithStreaming(updated, signal) {
+  stopSpeaking();
+  const playbackId = playbackIdRef.current;
+  const id = crypto.randomUUID();
+  const assistantMessage = { id, role: 'assistant', content: '' };
+  messagesRef.current = [...messagesRef.current, assistantMessage];
+  setMessages([...messagesRef.current]);
 
-    let completeText = '';
-    let toSpeak = '';
-    const soundQueue = [];
-    let soundRunning = false;
-    let textFinished = false;
-    let audioFailed = false;
-    let hadSpeech = false;
-    let finalizing = false;
+  let completeText = '';
+  let toSpeak = '';
+  const soundQueue = [];
+  let soundRunning = false;
+  let textFinished = false;
+  let audioFailed = false;
+  let finalizing = false;
+  let activePlayback = false;
 
-    const valid = () => playbackIdRef.current === playbackId && !signal.aborted;
+  const valid = () => playbackIdRef.current === playbackId && !signal.aborted;
 
-    const completeIfReady = () => {
-      if (finalizing || !textFinished || soundRunning || soundQueue.length) return;
-      finalizing = true;
-      if (valid()) armConversationMode();
-    };
+  const completeIfReady = () => {
+    if (finalizing || !textFinished || soundRunning || soundQueue.length) return;
+    finalizing = true;
+    if (valid()) armConversationMode();
+  };
 
-    const playSentence = async (sentence) => {
-      if (!valid() || !voiceEnabledRef.current) return;
-      const cleaned = cleanForSpeech(sentence);
-      if (!cleaned) return;
-      const speechAbort = new AbortController();
-      audioControllerRef.current = speechAbort;
-      const onAbort = () => speechAbort.abort();
-      signal.addEventListener('abort', onAbort, { once: true });
-      try {
-        const response = await fetch(`${NEXO_API_BASE}/api/piper/speech`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: cleaned, voice: selectedVoice }),
-          signal: speechAbort.signal,
-        });
-        if (!response.ok) {
-          let detail = 'Falha ao gerar voz neural.';
-          try { detail = (await response.json()).detail || detail; } catch { /* sem JSON */ }
-          throw new Error(detail);
-        }
-        const blob = await response.blob();
-        if (!valid() || speechAbort.signal.aborted) return;
-        const url = URL.createObjectURL(blob);
-        audioUrlRef.current = url;
-        const audio = new Audio(url);
-        audioRef.current = audio;
-        await new Promise((resolve, reject) => {
-          let settled = false;
-          const finish = (err) => {
-            if (settled) return;
-            settled = true;
-            audioFinishRef.current = null;
-            err ? reject(err) : resolve();
-          };
-          audioFinishRef.current = () => finish();
-          audio.onended = () => finish();
-          audio.onerror = () => finish(new Error('Não foi possível reproduzir o áudio.'));
-          audio.play().then(() => {
-            if (valid()) setStatus('speaking');
-          }).catch(finish);
-        });
-      } finally {
-        signal.removeEventListener('abort', onAbort);
-        if (audioRef.current) {
-          audioRef.current.pause();
-          audioRef.current.src = '';
-          audioRef.current = null;
-        }
-        if (audioUrlRef.current) {
-          URL.revokeObjectURL(audioUrlRef.current);
-          audioUrlRef.current = null;
-        }
-        if (audioControllerRef.current === speechAbort) audioControllerRef.current = null;
-      }
-    };
-
-    const drainSound = async () => {
-      if (soundRunning || !valid()) return;
-      soundRunning = true;
-      try {
-        while (soundQueue.length && valid() && voiceEnabledRef.current && !audioFailed) {
-          const sentence = soundQueue.shift();
-          try {
-            await playSentence(sentence);
-          } catch (err) {
-            if (!valid() || err.name === 'AbortError') return;
-            audioFailed = true;
-            setVoiceNotice(`Voz neural: ${err.message}. O texto continua disponível.`);
-            soundQueue.length = 0;
-          }
-        }
-      } finally {
-        soundRunning = false;
-        completeIfReady();
-      }
-    };
-
-    // Aguarda o término de uma frase para evitar pronúncias cortadas.
-    // Se o modelo não pontuar, limita o tamanho do bloco de áudio.
-    const queueCompletedSentences = (force = false) => {
-      if (!voiceEnabledRef.current || audioFailed || !valid()) return;
-      while (toSpeak) {
-        const match = /[.!?](?:\s|$)/.exec(toSpeak);
-        let end = match ? match.index + 1 : -1;
-        if (end < 0 && toSpeak.length >= 230) {
-          const boundary = toSpeak.lastIndexOf(' ', 230);
-          end = boundary > 80 ? boundary : 230;
-        }
-        if (end < 0 && force) end = Math.min(toSpeak.length, 650);
-        if (end < 0) break;
-        const chunk = toSpeak.slice(0, end).trim();
-        toSpeak = toSpeak.slice(end).trimStart();
-        if (chunk) {
-          soundQueue.push(chunk);
-          hadSpeech = true;
-        }
-      }
-      if (soundQueue.length) void drainSound();
-    };
-
+  // Solicita WAV ao backend. AbortController individual para interromper
+  // também as sínteses que estejam sendo antecipadas.
+  const getAudio = async (entry) => {
+    const controller = new AbortController();
+    speechControllersRef.current.add(controller);
+    const abort = () => controller.abort();
+    signal.addEventListener('abort', abort, { once: true });
     try {
-      const response = await fetch(`${NEXO_API_BASE}/api/chat/stream`, {
+      const response = await fetch(`${NEXO_API_BASE}/api/piper/speech`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: updated.filter(m => m.role === 'user' || m.role === 'assistant')
-          .map(m => ({ role: m.role, content: m.content })) }),
-        signal,
+        body: JSON.stringify({ text: entry.text, voice: selectedVoice }),
+        signal: controller.signal,
       });
-      if (!response.ok || !response.body) {
-        let detail = 'O servidor não iniciou o streaming.';
+      if (!response.ok) {
+        let detail = 'Falha ao gerar a voz local.';
         try { detail = (await response.json()).detail || detail; } catch { /* sem JSON */ }
         throw new Error(detail);
       }
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffered = '';
-      let serverError = null;
-      const processLine = (line) => {
-        if (!line.trim()) return;
-        const event = JSON.parse(line);
-        if (event.type === 'error') {
-          serverError = event.message || 'Erro ao gerar resposta.';
-          return;
-        }
-        if (event.type !== 'delta' || typeof event.text !== 'string') return;
-        completeText += event.text;
-        toSpeak += event.text;
-        assistantMessage.content = completeText;
-        messagesRef.current = [...messagesRef.current.slice(0, -1), { ...assistantMessage }];
-        setMessages([...messagesRef.current]);
-        queueCompletedSentences();
-      };
-      while (valid()) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffered += decoder.decode(value, { stream: true });
-        const lines = buffered.split('\n');
-        buffered = lines.pop() || '';
-        for (const line of lines) processLine(line);
-        if (serverError) break;
-      }
-      buffered += decoder.decode();
-      if (buffered.trim() && !serverError) processLine(buffered);
-      if (serverError) throw new Error(serverError);
-      if (!completeText.trim()) throw new Error('A IA retornou uma resposta vazia.');
-      queueCompletedSentences(true);
-      textFinished = true;
-      if (!voiceEnabledRef.current || !hadSpeech) completeIfReady();
-      else completeIfReady();
-      return completeText;
-    } catch (err) {
-      textFinished = true;
-      soundQueue.length = 0;
-      if (valid()) {
-        if (!completeText.trim()) {
-          messagesRef.current = messagesRef.current.filter(m => m.id !== id);
-          setMessages([...messagesRef.current]);
-        }
-      }
-      throw err;
+      const blob = await response.blob();
+      if (!valid() || controller.signal.aborted) return null;
+      return blob;
+    } finally {
+      signal.removeEventListener('abort', abort);
+      speechControllersRef.current.delete(controller);
     }
-  }
+  };
 
-  // Reconhecimento manual, após ativação ou em uma conversa contínua.
+  // Inicia a síntese de somente um item pendente. Chamado também quando
+  // novas frases chegam enquanto o áudio anterior já está tocando.
+  const prepareNext = () => {
+    if (!valid() || !voiceEnabledRef.current || audioFailed) return;
+    const next = soundQueue[0];
+    if (next && !next.promise) {
+      next.promise = getAudio(next);
+      // Evita Promise rejection não tratada durante cancelamentos.
+      next.promise.catch(() => {});
+    }
+  };
+
+  const playBlob = async (blob) => {
+    if (!blob || !valid()) return;
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audioRef.current = audio;
+    audioUrlRef.current = url;
+    activePlayback = true;
+    try {
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (error) => {
+          if (settled) return;
+          settled = true;
+          audioFinishRef.current = null;
+          error ? reject(error) : resolve();
+        };
+        audioFinishRef.current = () => finish();
+        audio.onended = () => finish();
+        audio.onerror = () => finish(new Error('Falha na reprodução do áudio.'));
+        audio.play().then(() => {
+          if (valid()) setStatus('speaking');
+        }).catch(finish);
+      });
+    } finally {
+      activePlayback = false;
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      if (audioRef.current === audio) audioRef.current = null;
+      if (audioUrlRef.current === url) audioUrlRef.current = null;
+      URL.revokeObjectURL(url);
+    }
+  };
+
+  const drainSound = async () => {
+    if (soundRunning || !valid()) return;
+    soundRunning = true;
+    try {
+      while (soundQueue.length && valid() && voiceEnabledRef.current && !audioFailed) {
+        prepareNext();
+        const entry = soundQueue.shift();
+        // Enquanto este trecho toca, o seguinte já começa a ser preparado.
+        prepareNext();
+        try {
+          const blob = await entry.promise;
+          if (!valid()) break;
+          // Caso a segunda frase chegue enquanto tocamos, o enqueue
+          // chamará prepareNext() imediatamente.
+          await playBlob(blob);
+        } catch (error) {
+          if (!valid() || error.name === 'AbortError') break;
+          audioFailed = true;
+          soundQueue.length = 0;
+          setVoiceNotice(`Voz Piper: ${error.message}. O texto continua disponível.`);
+        }
+      }
+    } finally {
+      soundRunning = false;
+      completeIfReady();
+    }
+  };
+
+  // Só corta em ponto final, interrogação e exclamação com palavra suficiente;
+  // não corta N.E.X.O., números decimais, URLs ou abreviações frequentes.
+  const nextBoundary = (text, force) => {
+    const minFirst = 40;
+    const maxChunk = 200;
+    const abbreviation = /(?:\b(?:sr|sra|dr|dra|prof|profa|etc|ex|av|art|pág|pag))\.$/i;
+    const acronym = /(?:\b[A-Za-z]\.){2,}$/;
+    for (let i = 0; i < text.length; i++) {
+      const mark = text[i];
+      if (!'.!?'.includes(mark)) continue;
+      if (i + 1 < text.length && !/\s/.test(text[i + 1])) continue;
+      const before = text.slice(0, i + 1);
+      if (mark === '.' && (abbreviation.test(before) || acronym.test(before))) continue;
+      if (i + 1 >= minFirst || force) return i + 1;
+    }
+    if (text.length >= maxChunk) {
+      const index = text.lastIndexOf(' ', maxChunk);
+      return index >= 70 ? index : maxChunk;
+    }
+    return force ? text.length : -1;
+  };
+
+  const queueCompletedSentences = (force = false) => {
+    if (!valid() || !voiceEnabledRef.current || audioFailed) return;
+    while (toSpeak.trim()) {
+      const boundary = nextBoundary(toSpeak, force);
+      if (boundary < 0) break;
+      const text = cleanForSpeech(toSpeak.slice(0, boundary));
+      toSpeak = toSpeak.slice(boundary).trimStart();
+      if (text && /[\p{L}\p{N}]/u.test(text)) soundQueue.push({ text, promise: null });
+    }
+    if (soundQueue.length) {
+      if (activePlayback) prepareNext();
+      void drainSound();
+    }
+  };
+
+  try {
+    const response = await fetch(`${NEXO_API_BASE}/api/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: updated.filter(m => m.role === 'user' || m.role === 'assistant')
+        .map(m => ({ role: m.role, content: m.content })) }),
+      signal,
+    });
+    if (!response.ok || !response.body) {
+      let detail = 'O servidor não iniciou o streaming.';
+      try { detail = (await response.json()).detail || detail; } catch { /* sem JSON */ }
+      throw new Error(detail);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = '';
+    let serverError = null;
+    const processLine = (line) => {
+      if (!line.trim()) return;
+      const event = JSON.parse(line);
+      if (event.type === 'error') { serverError = event.message || 'Erro ao gerar resposta.'; return; }
+      if (event.type !== 'delta' || typeof event.text !== 'string') return;
+      completeText += event.text;
+      toSpeak += event.text;
+      assistantMessage.content = completeText;
+      messagesRef.current = [...messagesRef.current.slice(0, -1), { ...assistantMessage }];
+      setMessages([...messagesRef.current]);
+      queueCompletedSentences();
+    };
+    while (valid()) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      const lines = buffered.split('\n');
+      buffered = lines.pop() || '';
+      for (const line of lines) processLine(line);
+      if (serverError) break;
+    }
+    buffered += decoder.decode();
+    if (buffered.trim() && !serverError) processLine(buffered);
+    if (serverError) throw new Error(serverError);
+    if (!completeText.trim()) throw new Error('A IA retornou uma resposta vazia.');
+    queueCompletedSentences(true);
+    textFinished = true;
+    completeIfReady();
+    return completeText;
+  } catch (error) {
+    textFinished = true;
+    soundQueue.length = 0;
+    if (valid() && !completeText.trim()) {
+      messagesRef.current = messagesRef.current.filter(m => m.id !== id);
+      setMessages([...messagesRef.current]);
+    }
+    throw error;
+  }
+}
+
+    // Reconhecimento manual, após ativação ou em uma conversa contínua.
   function startCommandListening(followUp = false) {
     if (!recognitionAvailable) return;
     if (followUp && (!conversationActiveRef.current || Date.now() >= conversationDeadlineRef.current)) return;
@@ -777,7 +820,7 @@ export default function App() {
       wakeRef.current = null;
       if (wakePendingRef.current) {
         wakePendingRef.current = false;
-        wakeTimerRef.current = setTimeout(() => startCommandListening(), 650);
+        wakeTimerRef.current = setTimeout(() => startCommandListening(), 300);
       } else if (wakeEnabledRef.current && !busyRef.current && !listeningRef.current) {
         wakeTimerRef.current = setTimeout(() => startWakeListening(), 1100);
       }

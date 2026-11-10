@@ -84,7 +84,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #7bdcf8; outline-
   flex-shrink: 0;
   z-index: 2;
   width: min(90vw, 500px);
-  margin: 0 0 70px;
+  margin: 0 0 10px;
 }
 .nexo-title {
   margin: 0;
@@ -208,10 +208,6 @@ button:focus-visible, input:focus-visible { outline: 2px solid #7bdcf8; outline-
   font-family: 'DM Sans', Arial, sans-serif;
   letter-spacing: normal;
 }
-.nexo-status {
-  margin-top: 12px;
-}
-
 /* Marcação discreta e arredores sem cabeçalho */
 .nexo-stage:not(.nexo-stage--chat) {
   background: radial-gradient(ellipse 38% 30% at 50% 44%, rgba(28,109,152,.065), transparent 100%);

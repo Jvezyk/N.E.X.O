@@ -72,9 +72,9 @@ def pronunciation_rules() -> dict[str, str]:
     if not path.is_file():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as erro:
-        log.warning("Não foi possível ler pronuncias.json: %s", erro)
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as error:
+        log.warning('pronuncias.json ignorado: %s', error)
         return {}
     if not isinstance(data, dict):
         raise ValueError('pronuncias.json deve conter um objeto JSON')
@@ -94,55 +94,34 @@ def prepare_text(text: str) -> str:
     return text
 
 
-
 def synthesize_wav(text: str) -> bytes:
-    """Gera WAV válido e detecta trechos sem áudio."""
+    """Síntese em CPU e WAV válido; voz permanece em cache entre solicitações."""
     from piper.config import SynthesisConfig
-
     with LOCK:
         voice = load_voice(str(model_path()))
-        texto = prepare_text(text)
-
-        if not texto or not any(c.isalnum() for c in texto):
-            raise ValueError(
-                "Trecho sem conteúdo pronunciável."
-            )
-
-        config = SynthesisConfig(
-            length_scale=speech_settings()
-        )
-
+        cleaned = prepare_text(text)
+        if not cleaned or not any(c.isalnum() for c in cleaned):
+            raise ValueError('Trecho sem conteúdo pronunciável.')
         stream = io.BytesIO()
-        gerou_audio = False
-
-        with wave.open(stream, "wb") as writer:
-            for chunk in voice.synthesize(
-                texto, syn_config=config
-            ):
+        config = SynthesisConfig(length_scale=speech_settings())
+        generated = False
+        with wave.open(stream, 'wb') as writer:
+            for chunk in voice.synthesize(cleaned, syn_config=config):
                 if not chunk.audio_int16_bytes:
                     continue
-
-                if not gerou_audio:
+                if not generated:
                     writer.setnchannels(chunk.sample_channels)
                     writer.setsampwidth(chunk.sample_width)
                     writer.setframerate(chunk.sample_rate)
-                    gerou_audio = True
-
+                    generated = True
                 writer.writeframes(chunk.audio_int16_bytes)
-
-            if not gerou_audio:
-                # Evita o erro de cabeçalho WAV incompleto.
+            if not generated:
                 writer.setnchannels(1)
                 writer.setsampwidth(2)
                 writer.setframerate(voice.config.sample_rate)
-
-        if not gerou_audio:
-            raise ValueError(
-                f"Piper não gerou áudio para: {texto!r}"
-            )
-
+        if not generated:
+            raise ValueError('Modelo não gerou áudio para o trecho recebido.')
         return stream.getvalue()
-
 
 
 def warmup_voice() -> None:
@@ -157,6 +136,13 @@ async def warmup_piper() -> None:
         log.info('Modelo Piper pronto para a primeira interação')
     except Exception:
         log.exception('Não foi possível pré-carregar o Piper')
+
+
+@router.post('/api/piper/warmup')
+async def piper_warmup():
+    """Carrega o modelo uma vez em segundo plano antes da primeira fala."""
+    await warmup_piper()
+    return {'ready': load_voice.cache_info().currsize > 0}
 
 
 @router.get('/api/piper/status')
